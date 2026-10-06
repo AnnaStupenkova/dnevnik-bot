@@ -38,7 +38,7 @@ def _empty(ax, title):
 def make_summary(scales, belief, emotions):
     """scales: [(название, до, после)], belief: {день: 0-10}, emotions: {эмоция: сколько дней}."""
     fig, (a1, a2, a3) = plt.subplots(
-        3, 1, figsize=(9, 15), dpi=120, gridspec_kw={"height_ratios": [9, 4, 5], "hspace": 0.42})
+        3, 1, figsize=(9, 17), dpi=120, gridspec_kw={"height_ratios": [max(9, len(scales)), 4, 5], "hspace": 0.38})
 
     # 1. Было и стало
     rows = [s for s in scales if s[1] is not None or s[2] is not None]

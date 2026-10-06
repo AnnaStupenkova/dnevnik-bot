@@ -167,6 +167,7 @@ class Core:
                    self.clock().isoformat(timespec="seconds"))
         self.set_state(uid, "consent")
         await self.pic(uid, "cover")
+        await self.pic(uid, "intro")
         await self.tg.send(uid, C.WELCOME, buttons=[[("Да", "consent:yes"), ("Нет", "consent:no")]])
 
     async def ask_time(self, uid, text, options, prefix):
@@ -237,6 +238,8 @@ class Core:
             buttons = self.multi_buttons(s, ctx.get("sel", []))
         elif kind == "text_opt":
             buttons = [[("Пропустить", "a:skip")]]
+        if ctx["i"] > 0:                       # можно вернуться и исправить прошлый ответ
+            buttons = (buttons or []) + [[("← Исправить прошлый ответ", "back:%d" % (ctx["i"]-1))]]
         await self.tg.send(uid, text, buttons=buttons)
 
     async def answer(self, uid, value):
@@ -253,8 +256,70 @@ class Core:
             self.set_state(uid, "idle")
             await self.finish_flow(uid, ctx)
 
+    # ---------- отчёты ведущей ----------
+    TITLES = {"start": "Знакомство и замер «Где я сейчас»", "intent": "Намерение",
+              "morning": "Утро", "evening": "Вечер",
+              "final_measure": "Замер «Где я теперь»", "final": "Итоговые вопросы"}
+
+    def labels(self, flow):
+        short = {k: s for k, _, s in C.SCALES}
+        out = {}
+        for st in C.FLOWS[flow]:
+            q = re.split(r"[?.]", st["q"].split("\n")[0].split("{")[0])[0].strip().rstrip(": ")
+            out[st["key"]] = short.get(st["key"], q) if flow == "measure" else q
+        return out
+
+    async def report(self, uid, flow, day, block):
+        """Присылает ведущим ответы участницы за только что пройденный блок."""
+        targets = [a for a in self.admins if a != uid]
+        if not targets:
+            return
+        u = self.user(uid); ans = self.answers(uid, block, day); lab = self.labels(flow)
+        head = "<b>%s</b> · %s" % (html.escape(u["name"] or str(uid)), self.TITLES.get(block, block))
+        if day:
+            head += " · день %d" % day
+        lines = [head]
+        if flow == "measure":
+            lines.append(" · ".join("%s %s" % (lab[st["key"]], ans.get(st["key"], "—"))
+                                    for st in C.FLOWS[flow] if st["kind"] == "scale"))
+            if ans.get("words"):
+                lines.append("Три слова: " + html.escape(ans["words"][:300]))
+        else:
+            for st in C.FLOWS[flow]:
+                v = ans.get(st["key"], "")
+                if v != "":
+                    lines.append("<i>%s</i>\n%s" % (lab[st["key"]], html.escape(v[:600])))
+        text = "\n".join(lines) if flow == "measure" else "\n\n".join(lines)
+        for a in targets:
+            try:
+                await self.tg.send(a, text[:4000])
+            except Exception as e:
+                print("report error", a, repr(e))
+
+    async def daily_digest(self):
+        """Раз в день, в 22:00 по времени ведущей: сводка и файлы с ответами."""
+        for a in self.admins:
+            u = self.user(a)
+            if not u or u["tz"] is None:
+                continue
+            loc = self.local_now(u); key = loc.date().toordinal()
+            if loc.hour < 22 or self.has(a, key, "digest"):
+                continue
+            self.mark(a, key, "digest")
+            try:
+                await self.tg.send(a, "<b>Сводка за день</b>\n\n" + self.stats_text())
+                f1, f2 = self.export_csv()
+                await self.tg.document(a, f1, "otvety_%s.csv" % loc.strftime("%d-%m"), "Все ответы на сегодня")
+                await self.tg.document(a, f2, "mysli_%s.csv" % loc.strftime("%d-%m"), "Отменённые мысли")
+            except Exception as e:
+                print("digest error", a, repr(e))
+
     async def finish_flow(self, uid, ctx):
         flow, day, block = ctx["flow"], ctx["day"], ctx["block"]
+        try:
+            await self.report(uid, flow, day, block)
+        except Exception as e:
+            print("report error", repr(e))
         if flow == "measure" and block == "start":
             await self.tg.send(uid, C.BEFORE_INTENT)
             await self.start_flow(uid, "intent", 0, "intent")
@@ -476,6 +541,12 @@ class Core:
                 await self.answer(uid, "")
             else:
                 return "Этот вопрос уже закрыт"
+        elif head == "back":
+            if st != "flow" or not arg.isdigit() or int(arg) >= ctx["i"]:
+                return "Этот вопрос уже закрыт"
+            ctx["i"] = int(arg); ctx["sel"] = []
+            self.set_state(uid, "flow", ctx)
+            await self.ask(uid)
         elif head == "m":
             if st != "flow" or self.step(ctx)["kind"] != "multi":
                 return "Этот вопрос уже закрыт"
@@ -561,6 +632,10 @@ class Core:
 
     # ---------- расписание ----------
     async def tick(self):
+        try:
+            await self.daily_digest()
+        except Exception as e:
+            print("digest error", repr(e))
         for r in self.q("SELECT id FROM users WHERE start_date IS NOT NULL").fetchall():
             try:
                 await self.tick_user(self.user(r["id"]))
@@ -614,12 +689,94 @@ class Core:
         return {"scales": scales, "belief": belief, "emotions": emotions, "steps": steps,
                 "words_start": start.get("words", ""), "words_final": final.get("words", "")}
 
+    # ---------- рассказ об итогах словами ----------
+    @staticmethod
+    def plural(n, one, few, many):
+        n = abs(n) % 100
+        if 11 <= n <= 14: return many
+        return one if n % 10 == 1 else few if 2 <= n % 10 <= 4 else many
+
+    def local_minutes(self, u, uid, key):
+        """Во сколько по местному времени участница делала шаг в каждый из дней."""
+        out = []
+        for r in self.q("SELECT day, ts FROM events WHERE user_id=? AND key=? AND day BETWEEN 1 AND 7", uid, key):
+            t = datetime.fromisoformat(r["ts"]) + timedelta(minutes=u["tz"] or 0)
+            out.append(t.hour*60 + t.minute)
+        return out
+
+    def story(self, uid, d):
+        u = self.user(uid); name = html.escape(u["name"] or "")
+        said = sum(self.has(uid, x, "said") for x in range(1, 8))
+        eves = sum(self.has(uid, x, "eve_done") for x in range(1, 8))
+        days = sum(self.has(uid, x, "said") or self.has(uid, x, "eve_done") or self.has(uid, x, "morning_done")
+                   for x in range(1, 8))
+        P = self.plural
+        L = ["<b>%s, вот твои семь дней</b>" % name if name else "<b>Вот твои семь дней</b>"]
+        # похвала по факту, без преувеличений
+        if days >= 7:
+            L.append("Ты была с собой все семь дней. Каждое утро и каждый вечер ты выбирала себя. Это большой труд, и ты его сделала.")
+        elif days >= 5:
+            L.append("Ты была с собой %d %s из семи. Это настоящая работа, и она видна." % (days, P(days, "день", "дня", "дней")))
+        elif days >= 3:
+            L.append("Ты была с собой %d %s из семи. Эти дни уже оставили в тебе след." % (days, P(days, "день", "дня", "дней")))
+        else:
+            L.append("Ты начала этот путь. Продолжить его можно в любой день.")
+        # привычка
+        h = ["Утреннюю настройку ты произнесла %d %s, вечер закрыла %d %s." % (
+            said, P(said, "раз", "раза", "раз"), eves, P(eves, "раз", "раза", "раз"))]
+        def steady(key):
+            m = self.local_minutes(u, uid, key)
+            if len(m) >= 4 and max(m) - min(m) <= 45:
+                avg = int(round(sum(m)/len(m))); return "%02d:%02d" % (avg // 60, avg % 60)
+        am, pm = steady("said"), steady("eve_done")
+        if am and pm:
+            h.append("Утро ты начинала почти в одно и то же время, около %s, а вечер закрывала около %s. Так рождается привычка." % (am, pm))
+        elif am:
+            h.append("Утро ты начинала почти в одно и то же время, около %s. Так рождается привычка." % am)
+        elif pm:
+            h.append("Вечер ты закрывала почти в одно и то же время, около %s. Так рождается привычка." % pm)
+        if d["steps"]:
+            h.append("Шаг дня ты сделала %d %s." % (d["steps"], P(d["steps"], "раз", "раза", "раз")))
+        L.append(" ".join(h))
+        nth = self.q("SELECT COUNT(*) c FROM thoughts WHERE user_id=?", uid).fetchone()["c"]
+        if nth:
+            L.append("Ты поймала и отменила %d %s, которые тянули тебя вниз, и каждый раз выбирала своё. "
+                     "Это и есть работа с состоянием: заметить и выбрать." % (nth, P(nth, "мысль", "мысли", "мыслей")))
+        # что изменилось по замеру
+        keys = {s_: k for k, _, s_ in C.SCALES}
+        better, same, worse = [], [], []
+        for nm, b, a in d["scales"]:
+            if b is None or a is None: continue
+            diff = (b - a) if keys.get(nm) in C.LOWER_IS_BETTER else (a - b)
+            item = "%s: %d → %d" % (nm, b, a)
+            (better if diff > 0 else worse if diff < 0 else same).append((diff, item, nm))
+        if better or same or worse:
+            if better:
+                better.sort(reverse=True)
+                L.append("<b>Что стало лучше</b>\n" + "\n".join("• " + i for _, i, _ in better))
+                L.append("Сильнее всего сдвинулось: %s." % better[0][2].lower())
+            if same:
+                L.append("<b>Осталось как было</b>\n" + "\n".join("• " + i for _, i, _ in same))
+            if worse:
+                L.append("<b>На что стоит посмотреть</b>\n" + "\n".join("• " + i for _, i, _ in worse)
+                         + "\nЭто не оценка. Неделя могла быть трудной, и цифры это честно показали.")
+        bl = d["belief"]
+        if len(bl) >= 2:
+            f, l = min(bl), max(bl)
+            L.append("Вера в себя по вечерам: в день %d — %d, в день %d — %d." % (f, bl[f], l, bl[l]))
+        L.append("Спасибо, что прошла этот путь честно. " + C.MOTTO)
+        return "\n\n".join(L)
+
     async def send_summary(self, uid):
         import stats
         await self.pic(uid, "itog")
         d = self.summary_data(uid)
         await self.tg.photo(uid, stats.make_summary(d["scales"], d["belief"], d["emotions"]), C.FINAL_CAPTION)
-        lines = ["<b>Твои семь дней</b>"]
+        try:
+            await self.tg.send(uid, self.story(uid, d))
+        except Exception as e:
+            print("story error", repr(e))
+        lines = ["<b>Ещё о твоей неделе</b>"]
         if d["words_start"] or d["words_final"]:
             lines.append("В начале: %s" % html.escape(d["words_start"] or "—"))
             lines.append("Сейчас: %s" % html.escape(d["words_final"] or "—"))
@@ -659,6 +816,8 @@ class Core:
                 "/demo final — прислать себе итог недели\n"
                 "/reset — стереть мои ответы и пройти заново\n"
                 "/update — забрать новые тексты с GitHub и перезапуститься\n\n"
+                "Ответы участниц приходят тебе сами: после знакомства, после утра и после вечера. "
+                "В 22:00 приходит сводка за день и файлы с ответами.\n\n"
                 "Чтобы загрузить запись, просто отправь мне аудио или голосовое."))
         elif cmd == "media":
             lines = ["%s %s" % ("✓" if self.media(s) else "—", n) for s, n in self.slots()]
