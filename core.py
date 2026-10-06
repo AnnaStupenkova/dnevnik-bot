@@ -4,8 +4,10 @@ import csv
 import html
 import io
 import json
+import os
 import re
 import sqlite3
+import zipfile
 from datetime import date, datetime, timedelta, timezone
 
 import content as C
@@ -68,6 +70,38 @@ class Core:
         self.admin_code = (admin_code or "").strip()
         self.program_start = program_start  # date или None
         self.clock = clock or (lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+        self.unpack_images()
+
+    # ---------- картинки ----------
+    HERE = os.path.dirname(os.path.abspath(__file__))
+    IMG_DIR = os.path.join(HERE, "images")
+
+    def unpack_images(self):
+        """Картинки лежат в images.zip рядом с ботом. Распаковываем, если архив новее папки."""
+        z = os.path.join(self.HERE, "images.zip")
+        mark = os.path.join(self.IMG_DIR, ".stamp")
+        try:
+            if os.path.exists(z) and (not os.path.exists(mark) or os.path.getmtime(z) > os.path.getmtime(mark)):
+                os.makedirs(self.IMG_DIR, exist_ok=True)
+                with zipfile.ZipFile(z) as f:
+                    for n in f.namelist():
+                        if n.endswith(".jpg") and "/" not in n and ".." not in n:
+                            open(os.path.join(self.IMG_DIR, n), "wb").write(f.read(n))
+                open(mark, "w").write("ok")
+        except Exception as e:
+            print("images error", repr(e))
+
+    async def pic(self, uid, name, caption=None):
+        """Отправляет картинку, если она есть. Возвращает True, если отправила."""
+        p = os.path.join(self.IMG_DIR, name + ".jpg")
+        if not os.path.exists(p):
+            return False
+        try:
+            await self.tg.photo(uid, open(p, "rb").read(), caption)
+            return True
+        except Exception as e:
+            print("pic error", name, repr(e))
+            return False
 
     # ---------- база ----------
     def q(self, sql, *args):
@@ -132,6 +166,7 @@ class Core:
             self.q("INSERT INTO users(id,name,created) VALUES(?,?,?)", uid, first_name or "",
                    self.clock().isoformat(timespec="seconds"))
         self.set_state(uid, "consent")
+        await self.pic(uid, "cover")
         await self.tg.send(uid, C.WELCOME, buttons=[[("Да", "consent:yes"), ("Нет", "consent:no")]])
 
     async def ask_time(self, uid, text, options, prefix):
@@ -145,6 +180,7 @@ class Core:
 
     async def set_bed(self, uid, minutes):
         self.q("UPDATE users SET bed=? WHERE id=?", fmt(minutes), uid)
+        await self.pic(uid, "zamer_start")
         await self.tg.send(uid, C.BEFORE_MEASURE)
         await self.start_flow(uid, "measure", 0, "start")
 
@@ -230,6 +266,7 @@ class Core:
         elif flow == "evening":
             self.mark(uid, day, "eve_done")
             if day == 7 and not self.has(uid, 7, "final_done"):
+                await self.pic(uid, "zamer_final")
                 await self.tg.send(uid, C.BEFORE_FINAL_MEASURE)
                 await self.start_flow(uid, "measure", 7, "final_measure")
             else:
@@ -268,8 +305,9 @@ class Core:
         d = C.DAYS[day - 1]
         first = not self.has(uid, day, "opened")
         self.mark(uid, day, "opened")
-        await self.tg.send(uid, "День %d · %s\n\n<b>%s</b>\n\n%s\n\n<i>%s</i>" % (
-            day, d["law"], d["title"], d["text"], C.MOTTO))
+        if not await self.pic(uid, "day%d" % day):
+            await self.tg.send(uid, "День %d · %s\n\n<b>%s</b>\n\n%s\n\n<i>%s</i>" % (
+                day, d["law"], d["title"], d["text"], C.MOTTO))
         m = self.media("msg%d" % day)
         if m:
             await self.tg.audio(uid, m[0], m[1])
@@ -465,6 +503,7 @@ class Core:
             day = int(arg)
             if self.has(uid, day, "eve_done"):
                 return "Этот вечер уже записан"
+            await self.pic(uid, "eve%d" % day)
             await self.start_flow(uid, "evening", day, "evening")
         elif head == "inbed":
             await self.in_bed(uid, int(arg))
@@ -577,6 +616,7 @@ class Core:
 
     async def send_summary(self, uid):
         import stats
+        await self.pic(uid, "itog")
         d = self.summary_data(uid)
         await self.tg.photo(uid, stats.make_summary(d["scales"], d["belief"], d["emotions"]), C.FINAL_CAPTION)
         lines = ["<b>Твои семь дней</b>"]
