@@ -156,6 +156,16 @@ class Core:
             return 0
         return (self.local_now(u).date() - date.fromisoformat(u["start_date"])).days + 1
 
+    def P(self, uid, tpl, **kw):
+        """Текст с обращением по имени. Если имени нет, обращение убирается."""
+        u = self.user(uid) or {}
+        name = html.escape((u.get("name") or "").strip())
+        if not name:
+            tpl = tpl.replace("{name}, ", "").replace(", {name}", "").replace("{name}", "")
+            if tpl[:1].islower():
+                tpl = tpl[:1].upper() + tpl[1:]
+        return tpl.format(name=name, **kw)
+
     # ---------- знакомство ----------
     async def on_start(self, uid, first_name=""):
         u = self.user(uid)
@@ -182,7 +192,7 @@ class Core:
     async def set_bed(self, uid, minutes):
         self.q("UPDATE users SET bed=? WHERE id=?", fmt(minutes), uid)
         await self.pic(uid, "zamer_start")
-        await self.tg.send(uid, C.BEFORE_MEASURE)
+        await self.tg.send(uid, self.P(uid, C.BEFORE_MEASURE))
         await self.start_flow(uid, "measure", 0, "start")
 
     async def finish_onboarding(self, uid):
@@ -193,7 +203,7 @@ class Core:
         self.q("UPDATE users SET start_date=? WHERE id=?", start.isoformat(), uid)
         self.set_state(uid, "idle")
         eve = fmt(evening_minute(parse_hhmm(u["bed"])))
-        await self.tg.send(uid, C.ONBOARD_DONE.format(
+        await self.tg.send(uid, self.P(uid, C.ONBOARD_DONE,
             date=start.strftime("%d.%m"), wake=u["wake"], eve=eve), menu=True)
 
     # ---------- опросы ----------
@@ -327,12 +337,12 @@ class Core:
             await self.finish_onboarding(uid)
         elif flow == "morning":
             self.mark(uid, day, "morning_done")
-            await self.tg.send(uid, C.MORNING_DONE, menu=True)
+            await self.tg.send(uid, self.P(uid, C.MORNING_DONE), menu=True)
         elif flow == "evening":
             self.mark(uid, day, "eve_done")
             if day == 7 and not self.has(uid, 7, "final_done"):
                 await self.pic(uid, "zamer_final")
-                await self.tg.send(uid, C.BEFORE_FINAL_MEASURE)
+                await self.tg.send(uid, self.P(uid, C.BEFORE_FINAL_MEASURE))
                 await self.start_flow(uid, "measure", 7, "final_measure")
             else:
                 await self.bed_prompt(uid, day)
@@ -354,7 +364,7 @@ class Core:
 
     async def send_morning(self, uid, day):
         self.set_state(uid, "await_said", {"day": day})
-        await self.tg.send(uid, C.MORNING_HELLO.format(day=day))
+        await self.tg.send(uid, self.P(uid, C.MORNING_HELLO, day=day))
         await self.send_nastroika(uid, "nastroika_am", C.NASTROIKA_AM_TEXT)
         await self.tg.send(uid, C.MORNING_SAID_HINT, buttons=[[("Произнесла", "said:%d" % day)]])
 
@@ -362,7 +372,7 @@ class Core:
         self.mark(uid, day, "said")
         self.mark(uid, day, "offered")
         self.set_state(uid, "idle")
-        await self.tg.send(uid, C.MESSAGE_WAITS, buttons=[[("Слушать послание", "open:%d" % day)]])
+        await self.tg.send(uid, self.P(uid, C.MESSAGE_WAITS), buttons=[[("Слушать послание", "open:%d" % day)]])
 
     async def open_message(self, uid, day):
         if not 1 <= day <= 7:
@@ -382,10 +392,10 @@ class Core:
 
     # ---------- вечер ----------
     async def send_evening(self, uid, day):
-        await self.tg.send(uid, C.EVENING_HELLO.format(day=day), buttons=[[("Начать", "eve:%d" % day)]])
+        await self.tg.send(uid, self.P(uid, C.EVENING_HELLO, day=day), buttons=[[("Начать", "eve:%d" % day)]])
 
     async def bed_prompt(self, uid, day):
-        await self.tg.send(uid, C.EVENING_DONE, buttons=[[("Я в постели", "inbed:%d" % day)]])
+        await self.tg.send(uid, self.P(uid, C.EVENING_DONE), buttons=[[("Я в постели", "inbed:%d" % day)]])
 
     async def in_bed(self, uid, day):
         await self.tg.send(uid, C.IN_BED)
@@ -394,7 +404,7 @@ class Core:
 
     async def released(self, uid, day):
         self.mark(uid, day, "released")
-        await self.tg.send(uid, C.RELEASED)
+        await self.tg.send(uid, self.P(uid, C.RELEASED))
         lid = C.DAYS[day - 1]["lullaby"] if 1 <= day <= 7 else "noch"
         await self.send_lullaby(uid, lid, buttons=[[("Выбрать другую", "lulpick")]])
 
@@ -423,7 +433,7 @@ class Core:
             self.set_state(uid, "thought1", {"resume": [u["state"], u["ctx"]]})
             await self.tg.send(uid, C.THOUGHT_ASK)
         elif text == C.BTN_SUPPORT:
-            await self.tg.send(uid, C.SUPPORT_INTRO)
+            await self.tg.send(uid, self.P(uid, C.SUPPORT_INTRO))
             await self.lullaby_from_group(uid, "support")
         elif text == C.BTN_PATH:
             await self.tg.send(uid, self.path_text(u))
@@ -555,9 +565,12 @@ class Core:
             if arg == "done":
                 if not sel:
                     return "Отметь хотя бы одну"
-                await self.answer(uid, ", ".join(self.options(s)[i] for i in sorted(sel)))
+                opts = self.options(s)
+                await self.answer(uid, ", ".join(opts[i] for i in sorted(sel) if i < len(opts)))
             else:
                 i = int(arg)
+                if not 0 <= i < len(self.options(s)):
+                    return "Этот вопрос уже закрыт"
                 sel.remove(i) if i in sel else sel.append(i)
                 ctx["sel"] = sel
                 self.set_state(uid, "flow", ctx)
@@ -655,14 +668,14 @@ class Core:
             if (offered and not self.has(uid, day, "opened") and not self.has(uid, day, "reminded")
                     and self.clock() - offered >= timedelta(minutes=40)):
                 self.mark(uid, day, "reminded")
-                await self.tg.send(uid, C.MESSAGE_REMINDER,
+                await self.tg.send(uid, self.P(uid, C.MESSAGE_REMINDER),
                                    buttons=[[("Слушать послание", "open:%d" % day)]])
             if not self.has(uid, day, "eve") and minute >= evening_minute(bed):
                 self.mark(uid, day, "eve")
                 await self.send_evening(uid, day)
         elif day == 8 and not self.has(uid, 8, "after") and minute >= wake:
             self.mark(uid, 8, "after")
-            await self.tg.send(uid, C.AFTER_PROGRAM, menu=True)
+            await self.tg.send(uid, self.P(uid, C.AFTER_PROGRAM), menu=True)
             m = self.media("nastroika_am")
             if m:
                 await self.tg.audio(uid, m[0], m[1])
