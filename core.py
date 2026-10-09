@@ -65,6 +65,10 @@ class Core:
         self.db = sqlite3.connect(db_path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(users)")}
+        if "tg_name" not in cols:
+            self.db.execute("ALTER TABLE users ADD COLUMN tg_name TEXT")
+            self.db.commit()
         self.tg = tg
         self.admins = set(admin_ids) | {r["id"] for r in self.db.execute("SELECT id FROM admins")}
         self.admin_code = (admin_code or "").strip()
@@ -156,6 +160,14 @@ class Core:
             return 0
         return (self.local_now(u).date() - date.fromisoformat(u["start_date"])).days + 1
 
+    def who(self, u):
+        """Как показать участницу ведущей: обращение и имя в Telegram."""
+        name = (u.get("name") or "").strip()
+        tg = (u.get("tg_name") or "").strip()
+        if name and tg and name.lower() != tg.lower():
+            return "<b>%s</b> (%s)" % (html.escape(name), html.escape(tg))
+        return "<b>%s</b>" % html.escape(name or tg or str(u["id"]))
+
     def P(self, uid, tpl, **kw):
         """Текст с обращением по имени. Если имени нет, обращение убирается."""
         u = self.user(uid) or {}
@@ -173,8 +185,8 @@ class Core:
             await self.tg.send(uid, C.IDLE_HINT, menu=True)
             return
         if not u:
-            self.q("INSERT INTO users(id,name,created) VALUES(?,?,?)", uid, first_name or "",
-                   self.clock().isoformat(timespec="seconds"))
+            self.q("INSERT INTO users(id,name,tg_name,created) VALUES(?,?,?,?)", uid, first_name or "",
+                   first_name or "", self.clock().isoformat(timespec="seconds"))
         self.set_state(uid, "consent")
         await self.pic(uid, "cover")
         await self.pic(uid, "intro")
@@ -243,7 +255,12 @@ class Core:
             buttons = [[(str(n), "a:%d" % n) for n in range(0, 6)],
                        [(str(n), "a:%d" % n) for n in range(6, 11)]]
         elif kind == "choice":
-            buttons = [[(o, "a:%d" % i)] for i, o in enumerate(self.options(s))]
+            opts = self.options(s)
+            if len(opts) > 3 and all(len(o) <= 16 for o in opts):   # короткие варианты по два в ряд
+                buttons = [[(opts[j], "a:%d" % j) for j in range(i, min(i + 2, len(opts)))]
+                           for i in range(0, len(opts), 2)]
+            else:
+                buttons = [[(o, "a:%d" % i)] for i, o in enumerate(opts)]
         elif kind == "multi":
             buttons = self.multi_buttons(s, ctx.get("sel", []))
         elif kind == "text_opt":
@@ -282,10 +299,10 @@ class Core:
     async def report(self, uid, flow, day, block):
         """Присылает ведущим ответы участницы за только что пройденный блок."""
         targets = [a for a in self.admins if a != uid]
-        if not targets:
+        if not targets or flow in ("morning", "pause"):
             return
         u = self.user(uid); ans = self.answers(uid, block, day); lab = self.labels(flow)
-        head = "<b>%s</b> · %s" % (html.escape(u["name"] or str(uid)), self.TITLES.get(block, block))
+        head = "%s · %s" % (self.who(u), self.TITLES.get(block, block))
         if day:
             head += " · день %d" % day
         lines = [head]
@@ -317,12 +334,60 @@ class Core:
                 continue
             self.mark(a, key, "digest")
             try:
-                await self.tg.send(a, "<b>Сводка за день</b>\n\n" + self.stats_text())
-                f1, f2 = self.export_csv()
-                await self.tg.document(a, f1, "otvety_%s.csv" % loc.strftime("%d-%m"), "Все ответы на сегодня")
-                await self.tg.document(a, f2, "mysli_%s.csv" % loc.strftime("%d-%m"), "Отменённые мысли")
+                await self.tg.send(a, self.digest_text(a)[:4000])
             except Exception as e:
                 print("digest error", a, repr(e))
+
+    def digest_text(self, admin_id):
+        """Сводка для ведущей: кто прошёл день, о чём группа, кого поддержать."""
+        full, morning_only, eve_only, missed, need = [], [], [], [], []
+        emo, body, thought, beliefs, beliefs_prev, prog, pz = {}, {}, {}, [], [], 0, 0
+        for r in self.q("SELECT id FROM users WHERE start_date IS NOT NULL").fetchall():
+            u = self.user(r["id"]); d = self.day_of(u)
+            if not 1 <= d <= 7:
+                continue
+            nm = self.who(u)
+            m, e = self.has(u["id"], d, "morning_done") or self.has(u["id"], d, "said"), self.has(u["id"], d, "eve_done")
+            (full if m and e else morning_only if m else eve_only if e else missed).append(nm)
+            ev = self.answers(u["id"], "evening", d)
+            for x in (ev.get("emotions") or "").split(", "):
+                if x: emo[x] = emo.get(x, 0) + 1
+            if (ev.get("belief") or "").isdigit(): beliefs.append(int(ev["belief"]))
+            pv = self.answers(u["id"], "evening", d - 1)
+            if (pv.get("belief") or "").isdigit(): beliefs_prev.append(int(pv["belief"]))
+            for b in ("pause1", "pause2"):
+                a = self.answers(u["id"], b, d)
+                if a.get("body"):
+                    pz += 1; body[a["body"]] = body.get(a["body"], 0) + 1
+                if a.get("thought") and a["thought"] != C.PAUSE_OWN:
+                    thought[a["thought"]] = thought.get(a["thought"], 0) + 1
+                if a.get("kind") == "Программа": prog += 1
+            # кого поддержать: два вечера подряд вера 3 и ниже, или два дня подряд без вечера
+            low = all((self.answers(u["id"], "evening", x).get("belief") or "9").isdigit()
+                      and int(self.answers(u["id"], "evening", x).get("belief") or 9) <= 3 for x in (d, d - 1)) and d >= 2
+            gone = d >= 2 and not e and not self.has(u["id"], d - 1, "eve_done")
+            if low: need.append(nm + " — низкая вера в себя два вечера подряд")
+            elif gone: need.append(nm + " — два дня без вечера")
+        top = lambda dct, k=3: ", ".join(x for x, _ in sorted(dct.items(), key=lambda kv: -kv[1])[:k])
+        L = ["<b>Сводка за день</b>"]
+        L.append("<b>Прошли утро и вечер:</b> " + (", ".join(full) or "пока никто"))
+        if morning_only: L.append("<b>Только утро:</b> " + ", ".join(morning_only))
+        if eve_only: L.append("<b>Только вечер:</b> " + ", ".join(eve_only))
+        if missed: L.append("<b>Пока без отметок сегодня:</b> " + ", ".join(missed))
+        g = []
+        if emo: g.append("Эмоции дня: " + top(emo) + ".")
+        if pz:
+            g.append("Паузы: %d. В теле чаще всего: %s." % (pz, top(body, 2).lower()))
+            if thought: g.append("Мысль, которая повторяется: «%s»." % top(thought, 1))
+            if prog: g.append("В программе ума себя узнавали %d %s." % (prog, self.plural(prog, "раз", "раза", "раз")))
+        if beliefs:
+            s_ = "Вера в себя в среднем: %.1f" % (sum(beliefs) / len(beliefs))
+            if beliefs_prev: s_ += " (вчера %.1f)" % (sum(beliefs_prev) / len(beliefs_prev))
+            g.append(s_ + ".")
+        if g: L.append("<b>О чём сегодня группа</b>\n" + "\n".join(g))
+        if need: L.append("<b>Кому стоит написать</b>\n" + "\n".join("• " + x for x in need))
+        L.append("Все ответы целиком: /export")
+        return "\n\n".join(L)
 
     async def finish_flow(self, uid, ctx):
         flow, day, block = ctx["flow"], ctx["day"], ctx["block"]
@@ -330,6 +395,10 @@ class Core:
             await self.report(uid, flow, day, block)
         except Exception as e:
             print("report error", repr(e))
+        if flow == "pause":
+            kind = self.answers(uid, block, day).get("kind", "")
+            await self.tg.send(uid, self.P(uid, C.PAUSE_DONE.get(kind, C.PAUSE_DONE["Не знаю"])), menu=True)
+            return
         if flow == "measure" and block == "start":
             await self.tg.send(uid, C.BEFORE_INTENT)
             await self.start_flow(uid, "intent", 0, "intent")
@@ -670,6 +739,13 @@ class Core:
                 self.mark(uid, day, "reminded")
                 await self.tg.send(uid, self.P(uid, C.MESSAGE_REMINDER),
                                    buttons=[[("Слушать послание", "open:%d" % day)]])
+            for n, pm in enumerate(self.pause_minutes(uid, day, wake, bed), 1):
+                key = "pause%d" % n
+                if (not self.has(uid, day, key) and pm <= minute < evening_minute(bed) - 30
+                        and u["state"] != "flow"):
+                    self.mark(uid, day, key)
+                    await self.send_pause(uid, day, key)
+                    u = self.user(uid)
             if not self.has(uid, day, "eve") and minute >= evening_minute(bed):
                 self.mark(uid, day, "eve")
                 await self.send_evening(uid, day)
@@ -679,6 +755,36 @@ class Core:
             m = self.media("nastroika_am")
             if m:
                 await self.tg.audio(uid, m[0], m[1])
+
+    # ---------- пауза среди дня ----------
+    def pause_minutes(self, uid, day, wake, bed):
+        """Две паузы в случайное, но постоянное для этого дня время: между пробуждением+3 ч и вечером-1 ч."""
+        import random
+        lo, hi = wake + 180, evening_minute(bed) - 60
+        if hi - lo < 120:
+            return []
+        rnd = random.Random(uid * 31 + day)
+        mid = (lo + hi) // 2
+        a = rnd.randint(lo, max(lo, mid - 45))
+        b = rnd.randint(min(hi, mid + 45), hi)
+        return [a, b]
+
+    async def send_pause(self, uid, day, key):
+        await self.tg.send(uid, self.P(uid, C.PAUSE_HELLO))
+        await self.start_flow(uid, "pause", day, key)
+
+    def pause_data(self, uid):
+        body, thought, prog, n = {}, {}, 0, 0
+        for d, k, v in self.q("SELECT day, key, value FROM answers WHERE user_id=? AND block LIKE 'pause%'",
+                              uid).fetchall():
+            if k == "body":
+                n += 1; body[v] = body.get(v, 0) + 1
+            elif k == "thought" and v != C.PAUSE_OWN:
+                thought[v] = thought.get(v, 0) + 1
+            elif k == "kind" and v == "Программа":
+                prog += 1
+        top = lambda dct: max(dct.items(), key=lambda kv: kv[1])[0] if dct else None
+        return {"n": n, "body": top(body), "thought": top(thought), "prog": prog}
 
     # ---------- итог недели ----------
     def summary_data(self, uid):
@@ -777,6 +883,16 @@ class Core:
         if len(bl) >= 2:
             f, l = min(bl), max(bl)
             L.append("Вера в себя по вечерам: в день %d — %d, в день %d — %d." % (f, bl[f], l, bl[l]))
+        pz = self.pause_data(uid)
+        if pz["n"]:
+            t = ["За неделю ты остановилась посреди дня %d %s." % (pz["n"], P(pz["n"], "раз", "раза", "раз"))]
+            if pz["body"]:
+                t.append("Чаще всего в теле было: %s." % pz["body"].lower())
+            if pz["thought"]:
+                t.append("Мысль, которая приходила чаще других: «%s»." % pz["thought"])
+            if pz["prog"]:
+                t.append("%d %s ты узнала в мысли программу ума." % (pz["prog"], P(pz["prog"], "раз", "раза", "раз")))
+            L.append("<b>Паузы среди дня</b>\n" + " ".join(t))
         L.append("Спасибо, что прошла этот путь честно. " + C.MOTTO)
         return "\n\n".join(L)
 
@@ -828,6 +944,8 @@ class Core:
                 "/demo pm 1 — прислать себе вечер дня 1\n"
                 "/demo final — прислать себе итог недели\n"
                 "/reset — стереть мои ответы и пройти заново\n"
+                "/users — список участниц и даты старта\n"
+                "/early Имя — начать участнице с завтрашнего дня, раньше общего старта\n"
                 "/update — забрать новые тексты с GitHub и перезапуститься\n\n"
                 "Ответы участниц приходят тебе сами: после знакомства, после утра и после вечера. "
                 "В 22:00 приходит сводка за день и файлы с ответами.\n\n"
@@ -854,6 +972,39 @@ class Core:
                     await self.send_evening(uid, int(args[1]))
             else:
                 await self.tg.send(uid, "Пример: /demo am 1")
+        elif cmd == "users":
+            rows = self.q("SELECT id, name, tg_name, start_date FROM users ORDER BY created").fetchall()
+            if not rows:
+                await self.tg.send(uid, "Пока никого нет.")
+            else:
+                lines = ["%s · %s · %s" % (self.who(dict(r)), r["id"],
+                         date.fromisoformat(r["start_date"]).strftime("%d.%m") if r["start_date"] else "знакомство не пройдено")
+                         for r in rows]
+                await self.tg.send(uid, "<b>Участницы</b> (имя · номер · первый день)\n\n" + "\n".join(lines))
+        elif cmd == "early":
+            key = " ".join(args).strip()
+            if not key:
+                await self.tg.send(uid, "Напиши так: /early Имя\nИли номер из списка /users")
+                return True
+            if key.isdigit():
+                rows = self.q("SELECT * FROM users WHERE id=?", int(key)).fetchall()
+            else:
+                rows = [r for r in self.q("SELECT * FROM users").fetchall()
+                        if (r["name"] or "").strip().lower() == key.lower()]
+            if not rows:
+                await self.tg.send(uid, "Не нашла. Посмотри список: /users")
+            elif len(rows) > 1:
+                await self.tg.send(uid, "Нашла несколько. Напиши номер из списка /users")
+            elif not rows[0]["start_date"]:
+                await self.tg.send(uid, "Она ещё не прошла знакомство. Попроси её закончить его, потом повтори команду.")
+            else:
+                r = rows[0]
+                u = self.user(r["id"])
+                start = self.local_now(u).date() + timedelta(days=1)
+                self.q("UPDATE users SET start_date=? WHERE id=?", start.isoformat(), r["id"])
+                await self.tg.send(uid, "Готово. %s начинает %s." % (html.escape(r["name"] or str(r["id"])), start.strftime("%d.%m")))
+                if r["id"] != uid:
+                    await self.tg.send(r["id"], self.P(r["id"], "{name}, твой первый день начнётся раньше общего старта: завтра, %s. Утром я напишу тебе в %s." % (start.strftime("%d.%m"), u["wake"])))
         elif cmd == "reset":
             for t in ("answers", "events", "thoughts", "voices", "plays"):
                 self.q("DELETE FROM %s WHERE user_id=?" % t, uid)
