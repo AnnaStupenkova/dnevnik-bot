@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS plays(user_id INTEGER, lid TEXT, ts TEXT);
 CREATE TABLE IF NOT EXISTS admins(id INTEGER PRIMARY KEY);
 """
 
-MENU_BUTTONS = (C.BTN_CANCEL, C.BTN_SUPPORT, C.BTN_PATH)
+MENU_BUTTONS = (C.BTN_CANCEL, C.BTN_SUPPORT, C.BTN_PATH, C.BTN_CANCEL_OLD)
 ONBOARDING = ("consent", "name", "tz", "wake", "bed")
 
 
@@ -122,8 +122,18 @@ class Core:
         return u
 
     def set_state(self, uid, state, ctx=None):
+        ctx = dict(ctx or {})
+        if state == "flow":
+            ctx["touch"] = self.clock().isoformat(timespec="seconds")   # когда последний раз трогали опрос
         self.q("UPDATE users SET state=?, ctx=? WHERE id=?", state,
-               json.dumps(ctx or {}, ensure_ascii=False), uid)
+               json.dumps(ctx, ensure_ascii=False), uid)
+
+    def busy(self, u):
+        """Человек сейчас отвечает на вопросы. Брошенный больше часа назад опрос не считается."""
+        if u["state"] != "flow":
+            return False
+        t = u["ctx"].get("touch")
+        return bool(t) and self.clock() - datetime.fromisoformat(t) < timedelta(minutes=60)
 
     def save(self, uid, day, block, key, value):
         self.q("INSERT OR REPLACE INTO answers VALUES(?,?,?,?,?,?)",
@@ -236,9 +246,33 @@ class Core:
         rows.append([("Готово", "m:done")])
         return rows
 
-    async def start_flow(self, uid, flow, day, block):
-        self.set_state(uid, "flow", {"flow": flow, "i": 0, "day": day, "block": block, "sel": []})
+    async def start_flow(self, uid, flow, day, block, resume=None):
+        ctx = {"flow": flow, "i": 0, "day": day, "block": block, "sel": []}
+        if resume:
+            ctx["resume"] = resume
+        self.set_state(uid, "flow", ctx)
         await self.ask(uid)
+
+    def step_ok(self, uid, ctx, step):
+        """Показывать ли шаг: в паузе часть вопросов только для тяжёлых чувств."""
+        cond = step.get("when")
+        if not cond:
+            return True
+        a = self.answers(uid, ctx["block"], ctx["day"])
+        heavy = a.get("feel", "") not in C.PAUSE_LIGHT
+        if cond == "heavy":
+            return heavy
+        if cond == "thought":
+            return heavy and bool((a.get("thought") or "").strip())
+        if cond == "cancel":
+            return heavy and a.get("decide") == "Отменяю"
+        return True
+
+    def step_vars(self, uid, ctx):
+        a = self.answers(uid, ctx["block"], ctx["day"])
+        feel = a.get("feel", "")
+        acc, pron, nom = C.FEEL_FORMS.get(feel, ("это чувство", "его", "это чувство"))
+        return {"feel_acc": acc, "feel_pron": pron, "feel_dat": "ей" if pron == "её" else "ему", "feel_nom": nom}
 
     async def ask(self, uid):
         u = self.user(uid)
@@ -248,6 +282,8 @@ class Core:
         if "{step}" in text:
             d = ctx["day"]
             text = text.format(step=C.DAYS[d - 1]["step"] if 1 <= d <= 7 else "")
+        elif "{feel_" in text:
+            text = text.format(**self.step_vars(uid, ctx))
         text = "<b>%s</b>" % text if "\n" not in text else text
         kind = s["kind"]
         buttons = None
@@ -264,7 +300,7 @@ class Core:
         elif kind == "multi":
             buttons = self.multi_buttons(s, ctx.get("sel", []))
         elif kind == "text_opt":
-            buttons = [[("Пропустить", "a:skip")]]
+            buttons = [[(s.get("skip", "Пропустить"), "a:skip")]]
         if ctx["i"] > 0:                       # можно вернуться и исправить прошлый ответ
             buttons = (buttons or []) + [[("← Исправить прошлый ответ", "back:%d" % (ctx["i"]-1))]]
         await self.tg.send(uid, text, buttons=buttons)
@@ -276,7 +312,10 @@ class Core:
         self.save(uid, ctx["day"], ctx["block"], s["key"], value)
         ctx["i"] += 1
         ctx["sel"] = []
-        if ctx["i"] < len(C.FLOWS[ctx["flow"]]):
+        steps = C.FLOWS[ctx["flow"]]
+        while ctx["i"] < len(steps) and not self.step_ok(uid, ctx, steps[ctx["i"]]):
+            ctx["i"] += 1
+        if ctx["i"] < len(steps):
             self.set_state(uid, "flow", ctx)
             await self.ask(uid)
         else:
@@ -355,13 +394,15 @@ class Core:
             if (ev.get("belief") or "").isdigit(): beliefs.append(int(ev["belief"]))
             pv = self.answers(u["id"], "evening", d - 1)
             if (pv.get("belief") or "").isdigit(): beliefs_prev.append(int(pv["belief"]))
-            for b in ("pause1", "pause2"):
-                a = self.answers(u["id"], b, d)
-                if a.get("body"):
-                    pz += 1; body[a["body"]] = body.get(a["body"], 0) + 1
-                if a.get("thought") and a["thought"] != C.PAUSE_OWN:
-                    thought[a["thought"]] = thought.get(a["thought"], 0) + 1
-                if a.get("kind") == "Программа": prog += 1
+            for r2 in self.q("SELECT key, value FROM answers WHERE user_id=? AND day=? AND block LIKE 'pause%'",
+                             u["id"], d).fetchall():
+                k2, v2 = r2["key"], r2["value"]
+                if k2 == "feel":
+                    pz += 1; thought[v2] = thought.get(v2, 0) + 1
+                elif k2 == "place":
+                    body[v2] = body.get(v2, 0) + 1
+                elif k2 == "decide" and v2 == "Отменяю":
+                    prog += 1
             # кого поддержать: два вечера подряд вера 3 и ниже, или два дня подряд без вечера
             low = all((self.answers(u["id"], "evening", x).get("belief") or "9").isdigit()
                       and int(self.answers(u["id"], "evening", x).get("belief") or 9) <= 3 for x in (d, d - 1)) and d >= 2
@@ -377,9 +418,9 @@ class Core:
         g = []
         if emo: g.append("Эмоции дня: " + top(emo) + ".")
         if pz:
-            g.append("Паузы: %d. В теле чаще всего: %s." % (pz, top(body, 2).lower()))
-            if thought: g.append("Мысль, которая повторяется: «%s»." % top(thought, 1))
-            if prog: g.append("В программе ума себя узнавали %d %s." % (prog, self.plural(prog, "раз", "раза", "раз")))
+            g.append("Паузы: %d. Чувства в паузах: %s." % (pz, top(thought, 3)))
+            if body: g.append("Где в теле чаще всего: %s." % top(body, 2))
+            if prog: g.append("Отменили мыслей: %d." % prog)
         if beliefs:
             s_ = "Вера в себя в среднем: %.1f" % (sum(beliefs) / len(beliefs))
             if beliefs_prev: s_ += " (вчера %.1f)" % (sum(beliefs_prev) / len(beliefs_prev))
@@ -396,8 +437,18 @@ class Core:
         except Exception as e:
             print("report error", repr(e))
         if flow == "pause":
-            kind = self.answers(uid, block, day).get("kind", "")
-            await self.tg.send(uid, self.P(uid, C.PAUSE_DONE.get(kind, C.PAUSE_DONE["Не знаю"])), menu=True)
+            a = self.answers(uid, block, day)
+            if a.get("feel", "") in C.PAUSE_LIGHT:
+                msg = C.PAUSE_DONE_LIGHT
+            elif a.get("decide") == "Отменяю" and (a.get("instead") or "").strip():
+                self.q("INSERT INTO thoughts VALUES(?,?,?,?)", uid, self.clock().isoformat(timespec="seconds"),
+                       a.get("thought", ""), a["instead"])
+                msg = C.PAUSE_DONE_CANCEL.format(instead=html.escape(a["instead"]))
+            else:
+                msg = C.PAUSE_DONE_SEEN
+            await self.tg.send(uid, self.P(uid, msg), menu=True)
+            if ctx.get("resume"):
+                await self.resume(uid, ctx["resume"])
             return
         if flow == "measure" and block == "start":
             await self.tg.send(uid, C.BEFORE_INTENT)
@@ -415,6 +466,10 @@ class Core:
                 await self.start_flow(uid, "measure", 7, "final_measure")
             else:
                 await self.bed_prompt(uid, day)
+            try:
+                await self.maybe_offer(uid, day)
+            except Exception as e:
+                print("offer error", repr(e))
         elif flow == "measure" and block == "final_measure":
             await self.tg.send(uid, C.BEFORE_FINAL_Q)
             await self.start_flow(uid, "final", 7, "final")
@@ -498,11 +553,18 @@ class Core:
     # ---------- кнопки дня ----------
     async def menu(self, uid, text):
         u = self.user(uid)
-        if text == C.BTN_CANCEL:
-            self.set_state(uid, "thought1", {"resume": [u["state"], u["ctx"]]})
-            await self.tg.send(uid, C.THOUGHT_ASK)
+        if text in (C.BTN_CANCEL, C.BTN_CANCEL_OLD):
+            day = max(self.day_of(u), 0)
+            n = self.q("SELECT COUNT(DISTINCT block) c FROM answers WHERE user_id=? AND day=? AND block LIKE 'pausem%'",
+                       uid, day).fetchone()["c"]
+            resume = [u["state"], u["ctx"]] if u["state"] not in ("idle", None) else None
+            if resume and u["state"] == "flow" and u["ctx"].get("flow") == "pause":
+                resume = None
+            await self.tg.send(uid, self.P(uid, C.PAUSE_HELLO))
+            await self.start_flow(uid, "pause", day, "pausem%d" % (n + 1), resume=resume)
         elif text == C.BTN_SUPPORT:
             await self.tg.send(uid, self.P(uid, C.SUPPORT_INTRO))
+            await self.tg.send(uid, C.SUPPORT_MORE, buttons=[[(C.CONS_BTN_YES, "cons:yes")]])
             await self.lullaby_from_group(uid, "support")
         elif text == C.BTN_PATH:
             await self.tg.send(uid, self.path_text(u))
@@ -624,6 +686,8 @@ class Core:
             if st != "flow" or not arg.isdigit() or int(arg) >= ctx["i"]:
                 return "Этот вопрос уже закрыт"
             ctx["i"] = int(arg); ctx["sel"] = []
+            while ctx["i"] > 0 and not self.step_ok(uid, ctx, C.FLOWS[ctx["flow"]][ctx["i"]]):
+                ctx["i"] -= 1
             self.set_state(uid, "flow", ctx)
             await self.ask(uid)
         elif head == "m":
@@ -645,6 +709,11 @@ class Core:
                 self.set_state(uid, "flow", ctx)
                 if msg_id is not None:
                     await self.tg.edit_buttons(uid, msg_id, self.multi_buttons(s, sel))
+        elif head == "cons":
+            if arg == "yes":
+                await self.consult_request(uid)
+            else:
+                await self.tg.send(uid, C.CONS_NO)
         elif head == "said":
             day = int(arg)
             if self.has(uid, day, "said"):
@@ -742,7 +811,7 @@ class Core:
             for n, pm in enumerate(self.pause_minutes(uid, day, wake, bed), 1):
                 key = "pause%d" % n
                 if (not self.has(uid, day, key) and pm <= minute < evening_minute(bed) - 30
-                        and u["state"] != "flow"):
+                        and not self.busy(u)):
                     self.mark(uid, day, key)
                     await self.send_pause(uid, day, key)
                     u = self.user(uid)
@@ -755,6 +824,63 @@ class Core:
             m = self.media("nastroika_am")
             if m:
                 await self.tg.audio(uid, m[0], m[1])
+
+    # ---------- личная встреча ----------
+    def repeating_heavy(self, uid):
+        """Тяжёлое чувство, которое в паузах повторилось три раза и больше."""
+        c = {}
+        for r in self.q("SELECT value FROM answers WHERE user_id=? AND key='feel' AND block LIKE 'pause%'", uid):
+            if r["value"] not in C.PAUSE_LIGHT:
+                c[r["value"]] = c.get(r["value"], 0) + 1
+        best = max(c.items(), key=lambda kv: kv[1]) if c else None
+        return best[0] if best and best[1] >= 3 else None
+
+    def low_belief(self, uid, day):
+        vals = [self.answers(uid, "evening", d).get("belief") for d in (day, day - 1)]
+        return all(v and v.isdigit() and int(v) <= 3 for v in vals)
+
+    async def maybe_offer(self, uid, day):
+        """Раз за неделю, не раньше третьего дня, тем, у кого тяжесть повторяется."""
+        if day < 3 or self.has(uid, 0, "cons_offer") or self.has(uid, 0, "cons_req"):
+            return
+        feel = self.repeating_heavy(uid)
+        if feel:
+            text = C.CONS_OFFER.format(name="{name}", feel_nom=C.FEEL_FORMS.get(feel, ("", "", feel))[2])
+        elif self.low_belief(uid, day):
+            text = C.CONS_OFFER_LOW
+        else:
+            return
+        self.mark(uid, 0, "cons_offer")
+        text = self.P(uid, text)
+        await self.tg.send(uid, text[:1].upper() + text[1:],
+                           buttons=[[(C.CONS_BTN_YES, "cons:yes")], [(C.CONS_BTN_NO, "cons:no")]])
+
+    async def consult_request(self, uid):
+        u = self.user(uid)
+        if self.has(uid, 0, "cons_req"):
+            await self.tg.send(uid, C.CONS_YES)
+            return
+        self.mark(uid, 0, "cons_req")
+        await self.tg.send(uid, C.CONS_YES)
+        feel = self.repeating_heavy(uid)
+        bel = [self.answers(uid, "evening", d).get("belief") for d in range(1, 8)]
+        bel = [b for b in bel if b]
+        lines = ["<b>Запрос на встречу</b>",
+                 '%s просит бесплатную встречу. <a href="tg://user?id=%d">Открыть её профиль</a>' % (self.who(u), uid)]
+        if feel:
+            pd = self.pause_data(uid)
+            lines.append("Повторяется: %s%s." % (feel, (", " + C.PLACE_IN.get(pd["place"], "")) if pd["place"] else ""))
+        if bel:
+            lines.append("Вера в себя по вечерам: " + ", ".join(bel[-3:]))
+        pain = self.answers(uid, "intent", 0).get("pain")
+        if pain:
+            lines.append("Что болит (из знакомства): " + html.escape(pain[:300]))
+        for a in self.admins:
+            if a != uid:
+                try:
+                    await self.tg.send(a, "\n".join(lines))
+                except Exception as e:
+                    print("cons notify error", repr(e))
 
     # ---------- пауза среди дня ----------
     def pause_minutes(self, uid, day, wake, bed):
@@ -774,17 +900,18 @@ class Core:
         await self.start_flow(uid, "pause", day, key)
 
     def pause_data(self, uid):
-        body, thought, prog, n = {}, {}, 0, 0
+        feel, place, n, admit, heavy = {}, {}, 0, 0, {}
         for d, k, v in self.q("SELECT day, key, value FROM answers WHERE user_id=? AND block LIKE 'pause%'",
                               uid).fetchall():
-            if k == "body":
-                n += 1; body[v] = body.get(v, 0) + 1
-            elif k == "thought" and v != C.PAUSE_OWN:
-                thought[v] = thought.get(v, 0) + 1
-            elif k == "kind" and v == "Программа":
-                prog += 1
+            if k == "feel":
+                n += 1; feel[v] = feel.get(v, 0) + 1
+                if v not in C.PAUSE_LIGHT: heavy[v] = heavy.get(v, 0) + 1
+            elif k == "place":
+                place[v] = place.get(v, 0) + 1
+            elif k == "admit":
+                admit += 1
         top = lambda dct: max(dct.items(), key=lambda kv: kv[1])[0] if dct else None
-        return {"n": n, "body": top(body), "thought": top(thought), "prog": prog}
+        return {"n": n, "feel": top(feel), "heavy": top(heavy), "place": top(place), "admit": admit}
 
     # ---------- итог недели ----------
     def summary_data(self, uid):
@@ -859,8 +986,9 @@ class Core:
         L.append(" ".join(h))
         nth = self.q("SELECT COUNT(*) c FROM thoughts WHERE user_id=?", uid).fetchone()["c"]
         if nth:
-            L.append("Ты поймала и отменила %d %s, которые тянули тебя вниз, и каждый раз выбирала своё. "
-                     "Это и есть работа с состоянием: заметить и выбрать." % (nth, P(nth, "мысль", "мысли", "мыслей")))
+            L.append("Ты поймала и отменила %d %s тебя вниз, и каждый раз выбирала своё. "
+                     "Это и есть работа с состоянием: заметить и выбрать." % (
+                         nth, P(nth, "мысль, которая тянула", "мысли, которые тянули", "мыслей, которые тянули")))
         # что изменилось по замеру
         keys = {s_: k for k, _, s_ in C.SCALES}
         better, same, worse = [], [], []
@@ -886,12 +1014,12 @@ class Core:
         pz = self.pause_data(uid)
         if pz["n"]:
             t = ["За неделю ты остановилась посреди дня %d %s." % (pz["n"], P(pz["n"], "раз", "раза", "раз"))]
-            if pz["body"]:
-                t.append("Чаще всего в теле было: %s." % pz["body"].lower())
-            if pz["thought"]:
-                t.append("Мысль, которая приходила чаще других: «%s»." % pz["thought"])
-            if pz["prog"]:
-                t.append("%d %s ты узнала в мысли программу ума." % (pz["prog"], P(pz["prog"], "раз", "раза", "раз")))
+            if pz["feel"]:
+                t.append("Чаще всего ты чувствовала: %s." % pz["feel"])
+            if pz["place"]:
+                t.append("Чаще всего это жило %s." % C.PLACE_IN.get(pz["place"], pz["place"]))
+            if pz["admit"]:
+                t.append("Ты признала %d %s." % (pz["admit"], P(pz["admit"], "тяжёлое чувство", "тяжёлых чувства", "тяжёлых чувств")))
             L.append("<b>Паузы среди дня</b>\n" + " ".join(t))
         L.append("Спасибо, что прошла этот путь честно. " + C.MOTTO)
         return "\n\n".join(L)
@@ -919,8 +1047,9 @@ class Core:
                      uid).fetchone()
         if fav:
             lines.append("\nТвоя колыбельная недели: «%s»" % C.LULLABIES[fav["lid"]]["title"])
+        lines.append("\n" + C.CONS_FINAL)
         lines.append("\n" + C.MOTTO)
-        await self.tg.send(uid, "\n".join(lines))
+        await self.tg.send(uid, "\n".join(lines), buttons=[[(C.CONS_BTN_YES, "cons:yes")]])
         v = self.q("SELECT file_id FROM voices WHERE user_id=? ORDER BY day LIMIT 1", uid).fetchone()
         if v:
             await self.tg.send(uid, C.VOICE_BACK)
