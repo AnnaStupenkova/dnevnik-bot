@@ -119,6 +119,11 @@ class Core:
             return None
         u = dict(r)
         u["ctx"] = json.loads(u["ctx"] or "{}")
+        if u["state"] == "flow":
+            f = C.FLOWS.get(u["ctx"].get("flow"))
+            if not f or u["ctx"].get("i", 0) >= len(f):
+                u["state"], u["ctx"] = "idle", {}
+                self.q("UPDATE users SET state='idle', ctx='{}' WHERE id=?", uid)
         return u
 
     def set_state(self, uid, state, ctx=None):
@@ -301,6 +306,8 @@ class Core:
             buttons = self.multi_buttons(s, ctx.get("sel", []))
         elif kind == "text_opt":
             buttons = [[(s.get("skip", "Пропустить"), "a:skip")]]
+        if ctx["flow"] == "pause" and ctx["i"] == 0 and not ctx["block"].startswith("pausem"):
+            buttons = (buttons or []) + [[(C.PAUSE_SKIP_BTN, "pskip")]]
         if ctx["i"] > 0:                       # можно вернуться и исправить прошлый ответ
             buttons = (buttons or []) + [[("← Исправить прошлый ответ", "back:%d" % (ctx["i"]-1))]]
         await self.tg.send(uid, text, buttons=buttons)
@@ -341,7 +348,7 @@ class Core:
         if not targets or flow in ("morning", "pause"):
             return
         u = self.user(uid); ans = self.answers(uid, block, day); lab = self.labels(flow)
-        head = "%s · %s" % (self.who(u), self.TITLES.get(block, block))
+        head = "%s · %s" % (self.who(u), "Вечер, глубже" if flow == "evening_deep" else self.TITLES.get(block, block))
         if day:
             head += " · день %d" % day
         lines = [head]
@@ -353,7 +360,7 @@ class Core:
         else:
             for st in C.FLOWS[flow]:
                 v = ans.get(st["key"], "")
-                if v != "":
+                if v != "" and st["key"] != "deeper":
                     lines.append("<i>%s</i>\n%s" % (lab[st["key"]], html.escape(v[:600])))
         text = "\n".join(lines) if flow == "measure" else "\n\n".join(lines)
         for a in targets:
@@ -448,6 +455,7 @@ class Core:
                 msg = C.PAUSE_DONE_SEEN
             await self.tg.send(uid, self.P(uid, msg), menu=True)
             if ctx.get("resume"):
+                await self.tg.send(uid, C.PAUSE_RESUME)
                 await self.resume(uid, ctx["resume"])
             return
         if flow == "measure" and block == "start":
@@ -460,16 +468,12 @@ class Core:
             await self.tg.send(uid, self.P(uid, C.MORNING_DONE), menu=True)
         elif flow == "evening":
             self.mark(uid, day, "eve_done")
-            if day == 7 and not self.has(uid, 7, "final_done"):
-                await self.pic(uid, "zamer_final")
-                await self.tg.send(uid, self.P(uid, C.BEFORE_FINAL_MEASURE))
-                await self.start_flow(uid, "measure", 7, "final_measure")
+            if self.answers(uid, "evening", day).get("deeper") == C.EVE_DEEPER:
+                await self.start_flow(uid, "evening_deep", day, "evening")
             else:
-                await self.bed_prompt(uid, day)
-            try:
-                await self.maybe_offer(uid, day)
-            except Exception as e:
-                print("offer error", repr(e))
+                await self.after_evening(uid, day)
+        elif flow == "evening_deep":
+            await self.after_evening(uid, day)
         elif flow == "measure" and block == "final_measure":
             await self.tg.send(uid, C.BEFORE_FINAL_Q)
             await self.start_flow(uid, "final", 7, "final")
@@ -477,6 +481,18 @@ class Core:
             self.mark(uid, 7, "final_done")
             await self.send_summary(uid)
             await self.bed_prompt(uid, day)
+
+    async def after_evening(self, uid, day):
+        if day == 7 and not self.has(uid, 7, "final_done"):
+            await self.pic(uid, "zamer_final")
+            await self.tg.send(uid, self.P(uid, C.BEFORE_FINAL_MEASURE))
+            await self.start_flow(uid, "measure", 7, "final_measure")
+        else:
+            await self.bed_prompt(uid, day)
+        try:
+            await self.maybe_offer(uid, day)
+        except Exception as e:
+            print("offer error", repr(e))
 
     # ---------- утро ----------
     async def send_nastroika(self, uid, slot, fallback):
@@ -725,8 +741,24 @@ class Core:
             day = int(arg)
             if self.has(uid, day, "eve_done"):
                 return "Этот вечер уже записан"
+            self.mark(uid, day, "eve_start")
+            if st == "flow" and ctx.get("flow") == "evening" and ctx.get("day") == day:
+                await self.ask(uid)
+                return
             await self.pic(uid, "eve%d" % day)
             await self.start_flow(uid, "evening", day, "evening")
+        elif head == "cont":
+            if st != "flow":
+                return "Этот вопрос уже закрыт"
+            await self.ask(uid)
+        elif head == "pskip":
+            if st != "flow" or ctx.get("flow") != "pause" or ctx.get("i") != 0:
+                return "Этот вопрос уже закрыт"
+            self.save(uid, ctx["day"], ctx["block"], "skipped", C.PAUSE_SKIP_BTN)
+            self.set_state(uid, "idle")
+            await self.tg.send(uid, self.P(uid, C.PAUSE_SKIPPED), menu=True)
+            if ctx.get("resume"):
+                await self.resume(uid, ctx["resume"])
         elif head == "inbed":
             await self.in_bed(uid, int(arg))
         elif head == "rel":
@@ -818,12 +850,30 @@ class Core:
             if not self.has(uid, day, "eve") and minute >= evening_minute(bed):
                 self.mark(uid, day, "eve")
                 await self.send_evening(uid, day)
+            eve_ts = self.event_ts(uid, day, "eve")
+            u = self.user(uid)
+            if (eve_ts and not self.has(uid, day, "eve_start") and not self.has(uid, day, "eve_done")
+                    and not self.has(uid, day, "eve_remind") and not self.busy(u)
+                    and self.due(eve_ts, 60, minute)):
+                self.mark(uid, day, "eve_remind")
+                await self.tg.send(uid, self.P(uid, C.EVENING_REMIND), buttons=[[("Начать", "eve:%d" % day)]])
+            c = u["ctx"]
+            if (u["state"] == "flow" and c.get("flow") == "evening" and c.get("day") == day and c.get("touch")
+                    and not self.has(uid, day, "eve_done") and not self.has(uid, day, "eve_nudge")
+                    and self.due(datetime.fromisoformat(c["touch"]), 30, minute)):
+                self.mark(uid, day, "eve_nudge")
+                await self.tg.send(uid, self.P(uid, C.EVENING_STUCK), buttons=[[("Продолжить", "cont")]])
         elif day == 8 and not self.has(uid, 8, "after") and minute >= wake:
             self.mark(uid, 8, "after")
             await self.tg.send(uid, self.P(uid, C.AFTER_PROGRAM), menu=True)
             m = self.media("nastroika_am")
             if m:
                 await self.tg.audio(uid, m[0], m[1])
+
+    def due(self, since, wait, minute):
+        """Прошло wait минут. Поздно вечером ждём меньше, чтобы успеть до полуночи: в полночь день сменится."""
+        passed = self.clock() - since
+        return passed >= timedelta(minutes=wait) or (minute >= 23 * 60 + 40 and passed >= timedelta(minutes=15))
 
     # ---------- личная встреча ----------
     def repeating_heavy(self, uid):
@@ -890,10 +940,7 @@ class Core:
         if hi - lo < 120:
             return []
         rnd = random.Random(uid * 31 + day)
-        mid = (lo + hi) // 2
-        a = rnd.randint(lo, max(lo, mid - 45))
-        b = rnd.randint(min(hi, mid + 45), hi)
-        return [a, b]
+        return [rnd.randint(lo, hi)]          # одна пауза в день
 
     async def send_pause(self, uid, day, key):
         await self.tg.send(uid, self.P(uid, C.PAUSE_HELLO))
@@ -1149,9 +1196,9 @@ class Core:
         lines = ["Нажали /start: %d" % total, "Прошли знакомство: %d" % ready, ""]
         for d in range(1, 8):
             c = {k: self.q("SELECT COUNT(*) c FROM events WHERE day=? AND key=?", d, k).fetchone()["c"]
-                 for k in ("said", "opened", "eve_done", "released")}
-            lines.append("День %d: настройка %d · послание %d · вечер %d · отпустили %d" % (
-                d, c["said"], c["opened"], c["eve_done"], c["released"]))
+                 for k in ("said", "opened", "eve_start", "eve_done", "released")}
+            lines.append("День %d: настройка %d · послание %d · вечер начали %d · вечер %d · отпустили %d" % (
+                d, c["said"], c["opened"], c["eve_start"], c["eve_done"], c["released"]))
         fin = self.q("SELECT COUNT(*) c FROM events WHERE day=7 AND key='final_done'").fetchone()["c"]
         lines.append("\nИтоговый замер: %d" % fin)
         return "\n".join(lines)
